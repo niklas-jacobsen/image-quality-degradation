@@ -1,0 +1,12 @@
+{
+    "images_dir": "../dataset/pictures",
+    "output_dir": "../output",
+    "modifier": [
+        "blur",
+        "noise",
+        "contrast"
+    ],
+    "passes": 10,
+    "step_percent": 10.0,
+    "storage_mode": "ram"
+}
