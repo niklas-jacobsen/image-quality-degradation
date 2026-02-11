@@ -94,13 +94,15 @@ class BenchmarkPipeline:
         modifier: ModifierStrategy,
         inference_backend: InferenceBackend,
         storage_backend: StorageBackend,
+        gpu_batch_size: int = 8,
         passes: int = 3,
-        step_size_percent: float = 10.0,
+        step_size_percent: float = 10.0
     ):
         self.dataset_loader = dataset_loader
         self.modifier = modifier
         self.inference_backend = inference_backend
         self.storage_backend = storage_backend
+        self.gpu_batch_size = gpu_batch_size
         self.passes = passes
         self.step_size_percent = step_size_percent
         self.baseline_ground_truth: Dict[str, List[Dict]] = {}
@@ -193,6 +195,46 @@ class BenchmarkPipeline:
             idx, (path, img, rec) = current_item
             current_future = gen_executor.submit(generate_batch_task, img, rec, pass_range, self.modifier) # type: ignore
 
+        # gpu batching
+        GPU_BATCH_SIZE = self.gpu_batch_size
+        batch_buffer = []
+
+        def flush_buffer(buffer):
+            if not buffer:
+                return
+            
+            #unpack buffer
+            b_imgs = [b[0] for b in buffer]
+            b_passes = [b[1] for b in buffer]
+            b_metrics = [b[2] for b in buffer]
+            b_recs = [b[3] for b in buffer]
+            b_gts = [b[4] for b in buffer]
+
+            #batch inference
+            b_preds = self.inference_backend.predict_batch(b_imgs)
+
+            #process results
+            for p, pred, img_metrics, rec, gt_list in zip(b_passes, b_preds, b_metrics, b_recs, b_gts):
+                self.preds_by_pass[p].append(pred)
+                self.gts_by_pass[p].append(gt_list)
+
+                n_dets = len(pred.scores)
+                self.total_dets[p] += n_dets
+                if n_dets > 0:
+                    self.total_conf[p] += float(sum(pred.scores, 0.0))
+                    
+                checkpoint_data = {
+                    "image_id": rec.id,
+                    "file_name": rec.file_name,
+                    "pass": p,
+                    "metrics": img_metrics,
+                    "detections": n_dets
+                }
+                f_out.write(json.dumps(checkpoint_data) + "\n")
+            
+            f_out.flush()
+            buffer.clear()
+
         with open(checkpoint_file, 'a') as f_out:
             while current_item is not None:
                 img_index, (path, base_img, rec) = current_item
@@ -226,50 +268,29 @@ class BenchmarkPipeline:
                                 print(f"[pipeline] Error calculating metrics for pass {p}: {e}")
                                 results_map[p] = measure_all(batch_data[p][1])
 
-                    # aggregate metrics
-                    batch_imgs = []
-                    batch_passes = []
-                    batch_metrics = []
-
+                    #accumulate into buffer
                     for p, mod_img in batch_data:
                         img_metrics = results_map.get(p, {})
                         for k, v in img_metrics.items():
                             self.metrics_accum[p][k] += v
 
-                        batch_imgs.append(mod_img)
-                        batch_passes.append(p)
-                        batch_metrics.append(img_metrics)
-
                         self.storage_backend.save(mod_img, self.modifier.name, p, rec.file_name)
-
-                    # predict & accumulate
-                    batch_preds = self.inference_backend.predict_batch(batch_imgs)
                         
-                    for p, pred, img_metrics in zip(batch_passes, batch_preds, batch_metrics):
-                        self.preds_by_pass[p].append(pred)
-                        self.gts_by_pass[p].append(gt_list)
+                        #add to gpu buffer
+                        batch_buffer.append((mod_img, p, img_metrics, rec, gt_list))
 
-                        n_dets = len(pred.scores)
-                        self.total_dets[p] += n_dets
-                        if n_dets > 0:
-                            self.total_conf[p] += float(sum(pred.scores, 0.0))
-                            
-                        checkpoint_data = {
-                            "image_id": rec.id,
-                            "file_name": rec.file_name,
-                            "pass": p,
-                            "metrics": img_metrics,
-                            "detections": n_dets
-                        }
-                        f_out.write(json.dumps(checkpoint_data) + "\n")
-                    
-                    f_out.flush()
+                    #flush if full
+                    if len(batch_buffer) >= GPU_BATCH_SIZE:
+                        flush_buffer(batch_buffer)
 
                     if (img_index + 1) % 10 == 0:
                         print(f"  Processed {img_index + 1}/{sample_count} images...", end="\r")
 
                 current_item = next_item
                 current_future = next_future
+            
+            #final flush
+            flush_buffer(batch_buffer)
         
         gen_executor.shutdown()
 

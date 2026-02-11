@@ -8,5 +8,6 @@
     ],
     "passes": 10,
     "step_percent": 10.0,
-    "storage_mode": "ram"
+    "storage_mode": "ram",
+    "gpu_batch_size": 8
 }

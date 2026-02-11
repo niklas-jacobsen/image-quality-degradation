@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "passes": 10,
     "step_percent": 10.0,
     "storage_mode": "ram",
+    "gpu_batch_size": 8,
     "config_path": None,
     "plot": False
 }
@@ -67,6 +68,7 @@ def parse_args():
     parser.add_argument("--storage-mode", "-sm", type=str, choices=["ram", "disk"], help="Storage mode: 'ram' (ephemeral) or 'disk'")
     parser.add_argument("--output-dir", "-out", type=str, help="Output directory for generated dataset")
     parser.add_argument("--config", "-c", dest="config_path", type=str, help="Path to JSON config file")
+    parser.add_argument("--gpu-batch-size", "-gbs", type=int, default=8, help="Batch size for GPU inference")
     
     return parser.parse_args()
 
@@ -195,6 +197,7 @@ def main_cli():
             modifier=current_modifier,
             inference_backend=backend,
             storage_backend=storage,
+            gpu_batch_size=args.gpu_batch_size,
             passes=args.passes,
             step_size_percent=args.step_percent
         )
