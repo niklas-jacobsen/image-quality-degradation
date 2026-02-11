@@ -6,6 +6,7 @@ import time
 import json
 import random
 from dataclasses import dataclass
+from collections import deque
 
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -182,18 +183,28 @@ class BenchmarkPipeline:
         print(f"[pipeline] Resource Allocation: Gen={gen_workers}, Metrics={metric_workers} (Total Cores: {total_cores})")
         
         gen_executor = ProcessPoolExecutor(max_workers=gen_workers)
+        metric_executor = ThreadPoolExecutor(max_workers=metric_workers)
         
+        window_size = gen_workers * 2
+        pending_futures = deque()
         data_iterator = enumerate(self.dataset_loader.iter_samples())
-        
-        try:
-            current_item = next(data_iterator)
-        except StopIteration:
-            current_item = None
 
-        current_future = None
-        if current_item:
-            idx, (path, img, rec) = current_item
-            current_future = gen_executor.submit(generate_batch_task, img, rec, pass_range, self.modifier) # type: ignore
+        def submit_next_task():
+            try:
+                idx, (path, img, rec) = next(data_iterator)
+
+                future = gen_executor.submit(generate_batch_task, img, rec, pass_range, self.modifier) # type: ignore
+
+                pending_futures.append((future, idx, path, rec))
+                return True
+            except StopIteration:
+                return False
+
+        print(f"[pipeline] filling prefetch queue (size={window_size})...")
+        # fill queue
+        for _ in range(window_size):
+            if not submit_next_task():
+                break
 
         # gpu batching
         GPU_BATCH_SIZE = self.gpu_batch_size
@@ -236,63 +247,61 @@ class BenchmarkPipeline:
             buffer.clear()
 
         with open(checkpoint_file, 'a') as f_out:
-            while current_item is not None:
-                img_index, (path, base_img, rec) = current_item
+            # process queue
+            while pending_futures:
+                future, img_index, path, rec = pending_futures.popleft()
+                
+                submit_next_task()
                 
                 try:
-                    next_item = next(data_iterator)
-                    next_idx, (next_path, next_img, next_rec) = next_item
-                    next_future = gen_executor.submit(generate_batch_task, next_img, next_rec, pass_range, self.modifier) # type: ignore
-                except StopIteration:
-                    next_item = None
-                    next_future = None
+                    batch_data = future.result()
+                except Exception as e:
+                    print(f"[pipeline] Error in generation task for {path}: {e}")
+                    continue
 
-                if current_future:
-                    gt_list = self._get_gt_list(rec, path)
-                    batch_data = current_future.result()
+                gt_list = self._get_gt_list(rec, path)
+                
+                # parallel metrics calculation
+                results_map: Dict[int, Dict[str, float]] = {} 
+                
+                #use persistent executor
+                future_to_pass = {
+                    metric_executor.submit(measure_all, img): p 
+                    for p, img in batch_data
+                }
+            
+                #collect results as they complete
+                for future in as_completed(future_to_pass):
+                    p = future_to_pass[future]
+                    try:
+                        results_map[p] = future.result() # type: ignore
+                    except Exception as e:
+                        print(f"[pipeline] Error calculating metrics for pass {p}: {e}")
+                        results_map[p] = measure_all(batch_data[p][1])
+
+                #accumulate into buffer
+                for p, mod_img in batch_data:
+                    img_metrics = results_map.get(p, {})
+                    for k, v in img_metrics.items():
+                        self.metrics_accum[p][k] += v
+
+                    self.storage_backend.save(mod_img, self.modifier.name, p, rec.file_name)
                     
-                    # parallel metrics calculation
-                    results_map: Dict[int, Dict[str, float]] = {} 
-                    with ThreadPoolExecutor(max_workers=metric_workers) as metric_executor:
-                        future_to_pass = {
-                            metric_executor.submit(measure_all, img): p 
-                            for p, img in batch_data
-                        }
-                    
-                    #collect results as they complete
-                        for future in as_completed(future_to_pass):
-                            p = future_to_pass[future]
-                            try:
-                                results_map[p] = future.result()
-                            except Exception as e:
-                                print(f"[pipeline] Error calculating metrics for pass {p}: {e}")
-                                results_map[p] = measure_all(batch_data[p][1])
+                    #add to gpu buffer
+                    batch_buffer.append((mod_img, p, img_metrics, rec, gt_list))
 
-                    #accumulate into buffer
-                    for p, mod_img in batch_data:
-                        img_metrics = results_map.get(p, {})
-                        for k, v in img_metrics.items():
-                            self.metrics_accum[p][k] += v
+                #flush if full
+                if len(batch_buffer) >= GPU_BATCH_SIZE:
+                    flush_buffer(batch_buffer)
 
-                        self.storage_backend.save(mod_img, self.modifier.name, p, rec.file_name)
-                        
-                        #add to gpu buffer
-                        batch_buffer.append((mod_img, p, img_metrics, rec, gt_list))
-
-                    #flush if full
-                    if len(batch_buffer) >= GPU_BATCH_SIZE:
-                        flush_buffer(batch_buffer)
-
-                    if (img_index + 1) % 10 == 0:
-                        print(f"  Processed {img_index + 1}/{sample_count} images...", end="\r")
-
-                current_item = next_item
-                current_future = next_future
+                if (img_index + 1) % 10 == 0:
+                    print(f"  Processed {img_index + 1}/{sample_count} images...", end="\r")
             
             #final flush
             flush_buffer(batch_buffer)
         
         gen_executor.shutdown()
+        metric_executor.shutdown()
 
         t_end = time.time()
         print(f"\n[pipeline] All images processed in {t_end - t_start:.1f}s. Computing final mAP...")
