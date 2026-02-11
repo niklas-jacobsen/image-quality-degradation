@@ -99,12 +99,31 @@ class BenchmarkPipeline:
 
     def build_baseline_ground_truth(self) -> None:
         self.baseline_ground_truth = {}
+        
+        batch_imgs = []
+        batch_keys = []
+        batch_size = 32
+
         for path, img, rec in self.dataset_loader.iter_samples():
             key = self._baseline_key(rec, path)
-            pred = self.inference_backend.predict(img)
-            self.baseline_ground_truth[key] = [
-                {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
-            ]
+            batch_imgs.append(img)
+            batch_keys.append(key)
+            
+            if len(batch_imgs) >= batch_size:
+                preds = self.inference_backend.predict_batch(batch_imgs)
+                for k, pred in zip(batch_keys, preds):
+                    self.baseline_ground_truth[k] = [
+                        {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+                    ]
+                batch_imgs = []
+                batch_keys = []
+        
+        if batch_imgs:
+            preds = self.inference_backend.predict_batch(batch_imgs)
+            for k, pred in zip(batch_keys, preds):
+                self.baseline_ground_truth[k] = [
+                    {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+                ]
 
 
     def _get_gt_list(self, rec: ImageRecord, path: str) -> List[Dict]:
@@ -118,7 +137,6 @@ class BenchmarkPipeline:
         """
         results: Dict[int, Dict] = {}
 
-        
         sample_count = len(self.dataset_loader.images)
 
         if sample_count == 0:
