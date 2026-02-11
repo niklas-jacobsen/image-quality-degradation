@@ -119,10 +119,12 @@ def main_cli():
     json_filename = f"thresholds_{run_id}.json"
     
     base_output_dir = args.output_dir
+    active_output_dir = base_output_dir
     
     if args.storage_mode == "disk":
         run_output_dir = os.path.join(base_output_dir, f"run_{run_id}")
         os.makedirs(run_output_dir, exist_ok=True)
+        active_output_dir = run_output_dir
         print(f"[Output] Created run directory: {run_output_dir}")
         
         storage = DiskBackend(run_output_dir)
@@ -166,7 +168,11 @@ def main_cli():
     
     # MAIN LOOP
 
+    t_start_total = datetime.now()
+
     for mod_name in target_modifiers:
+        t_start_mod = datetime.now()
+
         print(f"\n{'='*40}")
         print(f" PROCESSING: {mod_name.upper()}")
         print(f"{'='*40}")
@@ -182,6 +188,8 @@ def main_cli():
             print(f"[Error] Instantiation failed for {mod_name}: {e}")
             continue
 
+        checkpoint_filename = f"checkpoint_{current_modifier.name}.jsonl"
+
         pipeline = BenchmarkPipeline(
             dataset_loader=loader,
             modifier=current_modifier,
@@ -192,6 +200,10 @@ def main_cli():
         )
 
         results = pipeline.run()
+
+        if os.path.exists(checkpoint_filename):
+            destination = os.path.join(active_output_dir, checkpoint_filename)
+            shutil.move(checkpoint_filename, destination)
         
         # ANALYSIS
 
@@ -205,15 +217,23 @@ def main_cli():
         #print summary
         if analysis_data.get("fail_pass"):
              print(f"[Analysis] Threshold reached at Pass {analysis_data['fail_pass']}")
-             print(f"           Metrics: {analysis_data['thresholds']}")
+             print(f"           Metrics: {list(analysis_data['thresholds'].items())}")
         else:
              print(f"[Analysis] Robust (No threshold reached).")
 
+        t_end_mod = datetime.now()
+        duration_mod = (t_end_mod - t_start_mod).total_seconds()
+        
         full_report["results"][mod_name] = {
             "analysis": analysis_data,
             "raw_scores": results
         }
+        print(f"[Timing] {mod_name} pipleline took {duration_mod:.2f}s")
     
+    t_end_total = datetime.now()
+    full_report["total_runtime_seconds"] = (t_end_total - t_start_total).total_seconds()
+    print(f"\n[Timing] Total execution time: {full_report['total_runtime_seconds']:.2f}s")
+
     #save final json
     try:
         with open(final_json_path, "w") as f:

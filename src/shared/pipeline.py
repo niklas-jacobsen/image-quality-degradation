@@ -3,7 +3,12 @@ import numpy as np
 import cv2 as cv
 import os
 import time
+import json
+import random
 from dataclasses import dataclass
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .inference import InferenceBackend, InferenceResult
 from .storage import StorageBackend
@@ -26,11 +31,18 @@ class DatasetLoader:
     def __init__(self, images_dir: str):
         self.images_dir = images_dir
         self.images: Dict[int, ImageRecord] = {}
+
+        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
         
         for idx, fname in enumerate(sorted(os.listdir(images_dir))):
             path = os.path.join(images_dir, fname)
+
             if not os.path.isfile(path):
                 continue
+
+            if not fname.lower().endswith(valid_exts):
+                continue
+
             self.images[idx] = ImageRecord(
                 id=idx,
                 file_name=fname,
@@ -73,6 +85,14 @@ class BenchmarkPipeline:
         self.step_size_percent = step_size_percent
         self.baseline_ground_truth: Dict[str, List[Dict]] = {}
 
+        #inmemory storage for final mAP calculation
+        self.preds_by_pass: Dict[int, List[InferenceResult]] = {p: [] for p in range(self.passes + 1)}
+        self.gts_by_pass: Dict[int, List[List[Dict]]] = {p: [] for p in range(self.passes + 1)}
+        
+        self.metrics_accum: Dict[int, Dict[str, float]] = {p: {"brightness": 0.0, "contrast": 0.0, "sharpness": 0.0, "entropy": 0.0, "overexposure": 0.0} for p in range(self.passes + 1)}
+        self.total_conf: Dict[int, float] = {p: 0.0 for p in range(self.passes + 1)}
+        self.total_dets: Dict[int, int] = {p: 0 for p in range(self.passes + 1)}
+
     def _baseline_key(self, rec: ImageRecord, path: str) -> str:
         return rec.file_name if rec.file_name else path
 
@@ -98,9 +118,10 @@ class BenchmarkPipeline:
         """
         results: Dict[int, Dict] = {}
 
-        #materialize samples once so indexing is stable across passes
-        samples = list(self.dataset_loader.iter_samples())
-        if not samples:
+        
+        sample_count = len(self.dataset_loader.images)
+
+        if sample_count == 0:
             print("[pipeline] no readable images found")
             return results
 
@@ -109,55 +130,114 @@ class BenchmarkPipeline:
 
         pass_range = range(0, self.passes + 1)
 
-        for p in pass_range:
-            print(f"[pipeline] running pass {p}/{self.passes}")
+        # jsonl checkpoint file
+        checkpoint_file = f"checkpoint_{self.modifier.name}.jsonl"
+        
+        print(f"[pipeline] Starting Image-Centric Processing for {sample_count} images...")
+        t_start = time.time()
 
-            preds_all: List[InferenceResult] = []
-            gts_all: List[List[Dict]] = []
-            
-            metrics_accum = {"brightness": 0.0, "contrast": 0.0, "sharpness": 0.0, "entropy": 0.0, "overexposure": 0.0}
-            total_conf = 0.0
-            total_dets = 0
-            sample_count = len(samples)
-
-            t0 = time.time()
-
-            for img_index, (path, img, rec) in enumerate(samples):
-                #apply no modifier in baseline generation pass only
-                mod_img = img.copy() if p == 0 else self.modifier.apply(img, p)
-
-                #measure image quality metrics
-                img_metrics = measure_all(mod_img)
-                for k, v in img_metrics.items():
-                    metrics_accum[k] += v
-
-                self.storage_backend.save(mod_img, self.modifier.name, p, rec.file_name)
+        # IMAGE-CENTRIC LOOP
+        with open(checkpoint_file, 'a') as f_out:
+            for img_index, (path, base_img, rec) in enumerate(self.dataset_loader.iter_samples()):
                 
-                #predict
-                pred = self.inference_backend.predict(mod_img)
-                preds_all.append(pred)
-
-                n_dets = len(pred.scores)
-                total_dets += n_dets
-                if n_dets > 0:
-                    total_conf += float(sum(pred.scores, 0.0))
-
                 gt_list = self._get_gt_list(rec, path)
-                gts_all.append(gt_list)
 
-            t1 = time.time()
-            print(f"[pipeline] inference done for pass {p}, time {t1 - t0:.1f}s, computing metrics")
+                batch_data = []
+                for p in pass_range:
+                    if p == 0:
+                        mod_img = base_img.copy()
+                    else:
+                        if hasattr(self.modifier, 'apply'):
+                            #deterministic seeding
+                            seed_val = 42 + p + rec.id
+                            random.seed(seed_val)
+                            np.random.seed(seed_val)
+                            mod_img = self.modifier.apply(base_img, p)
+                        else:
+                             mod_img = base_img.copy()
 
-            mAP = evaluate_map_at_iou(preds_all, gts_all, iou_thresh=0.5)
+                    batch_data.append((p, mod_img))
+                       
+                # map p -> metrics_dict
+                results_map: Dict[int, Dict[str, float]] = {} 
+                
+                with ThreadPoolExecutor() as executor:
+                    future_to_pass = {
+                        executor.submit(measure_all, img): p 
+                        for p, img in batch_data
+                    }
+                    
+                    #collect results as they complete
+                    for future in as_completed(future_to_pass):
+                        p = future_to_pass[future]
+                        try:
+                            results_map[p] = future.result()
+                        except Exception as e:
+                            print(f"[pipeline] Error calculating metrics for pass {p}: {e}")
+                            results_map[p] = measure_all(batch_data[p][1])
+
+                # aggregate metrics
+                batch_imgs = []
+                batch_passes = []
+                batch_metrics = []
+
+                for p, mod_img in batch_data:
+                    # Retrieve parallel result
+                    img_metrics = results_map.get(p, {})
+                    
+                    # Accumulate global stats
+                    for k, v in img_metrics.items():
+                        self.metrics_accum[p][k] += v
+
+                    # Prepare for batch inference
+                    batch_imgs.append(mod_img)
+                    batch_passes.append(p)
+                    batch_metrics.append(img_metrics)
+
+                    # save image to storage backend
+                    self.storage_backend.save(mod_img, self.modifier.name, p, rec.file_name)
+
+                # predict & accumulate
+                batch_preds = self.inference_backend.predict_batch(batch_imgs)
+                    
+                for p, pred, img_metrics in zip(batch_passes, batch_preds, batch_metrics):
+                    self.preds_by_pass[p].append(pred)
+                    self.gts_by_pass[p].append(gt_list)
+
+                    n_dets = len(pred.scores)
+                    self.total_dets[p] += n_dets
+                    if n_dets > 0:
+                        self.total_conf[p] += float(sum(pred.scores, 0.0))
+                        
+                    checkpoint_data = {
+                        "image_id": rec.id,
+                        "file_name": rec.file_name,
+                        "pass": p,
+                        "metrics": img_metrics,
+                        "detections": n_dets
+                    }
+                    f_out.write(json.dumps(checkpoint_data) + "\n")
+                
+                f_out.flush()
+
+                if (img_index + 1) % 10 == 0:
+                    print(f"  Processed {img_index + 1}/{sample_count} images...", end="\r")
+
+        t_end = time.time()
+        print(f"\n[pipeline] All images processed in {t_end - t_start:.1f}s. Computing final mAP...")
+
+        #calculate final aggregated metrics per pass
+        for p in pass_range:
+            mAP = evaluate_map_at_iou(self.preds_by_pass[p], self.gts_by_pass[p], iou_thresh=0.5)
             
             #calculate averages
-            avg_metrics = {k: v / sample_count for k, v in metrics_accum.items()}
+            avg_metrics = {k: v / sample_count for k, v in self.metrics_accum[p].items()}
             
             #global average confidence (sum of all confidences/total number of detections)
-            avg_conf = (total_conf / total_dets) if total_dets > 0 else 0.0
+            avg_conf = (self.total_conf[p] / self.total_dets[p]) if self.total_dets[p] > 0 else 0.0
             
             #average detections per image (total dets/number of images)
-            avg_count = total_dets / sample_count
+            avg_count = self.total_dets[p] / sample_count
 
             print(f"[pipeline] pass {p}: mAP={mAP:.3f} | Confidence={avg_conf:.3f} | Detection Count={avg_count:.1f}")
 
@@ -194,6 +274,7 @@ class BenchmarkPipeline:
         plt.tight_layout()
         os.makedirs("results", exist_ok=True)
         save_path = os.path.join("results", "performance_curve.png")
+
         plt.savefig(save_path)
         print(f"[plot] Saved results plot to {save_path}")
         plt.close()
