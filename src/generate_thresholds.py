@@ -239,6 +239,16 @@ def main_cli():
         with open(final_json_path, "w") as f:
             json.dump(full_report, f, indent=4)
         print(f"\n[Success] Full analysis saved to: {final_json_path}")
+        
+        #cleanup checkpoints if save was successful
+        for fname in os.listdir(active_output_dir):
+            if fname.startswith("checkpoint_") and fname.endswith(".jsonl"):
+                file_path = os.path.join(active_output_dir, fname)
+                try:
+                    os.remove(file_path)
+                except OSError as e:
+                    print(f"[Warning] Failed to delete checkpoint {fname}: {e}")
+
     except Exception as e:
         print(f"[Error] Failed to save JSON: {e}")
 
