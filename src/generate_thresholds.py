@@ -16,7 +16,7 @@ from src.shared.storage import DiskBackend, EphemeralBackend
 from src.shared.inference import YOLOInference
 from src.shared.utils import evaluate_map_at_iou
 from src.shared.analysis import find_thresholds
-from src.shared.pipeline import BenchmarkPipeline, DatasetLoader
+from src.shared.pipeline import BenchmarkPipeline, DatasetLoader, compute_baseline
 
 DEFAULT_CONFIG = {
     "images_dir": None,
@@ -167,6 +167,12 @@ def main_cli():
         "config": vars(args),
         "results": {}
     }
+      
+    print(f"\n{'='*40}")
+    print(f" PRE-COMPUTING GROUND TRUTH")
+    print(f"{'='*40}")
+    
+    baseline_ground_truth = compute_baseline(loader, backend, args.gpu_batch_size)
     
     # MAIN LOOP
 
@@ -199,7 +205,8 @@ def main_cli():
             storage_backend=storage,
             gpu_batch_size=args.gpu_batch_size,
             passes=args.passes,
-            step_size_percent=args.step_percent
+            step_size_percent=args.step_percent,
+            baseline_data=baseline_ground_truth
         )
 
         results = pipeline.run()

@@ -85,6 +85,43 @@ class DatasetLoader:
                 continue
             yield path, img, rec
 
+def _baseline_key(rec: ImageRecord, path: str) -> str:
+    return rec.file_name if rec.file_name else path
+
+def compute_baseline(dataset_loader: DatasetLoader, inference_backend: InferenceBackend, batch_size: int = 32) -> Dict[str, List[Dict]]:
+    """
+    Computes baseline predictions for the entire dataset.
+    """
+    baseline_ground_truth = {}
+    
+    batch_imgs = []
+    batch_keys = []
+
+    print(f"[compute_baseline] Generating baseline ground truth for {len(dataset_loader.images)} images...")
+
+    for path, img, rec in dataset_loader.iter_samples():
+        key = _baseline_key(rec, path)
+        batch_imgs.append(img)
+        batch_keys.append(key)
+        
+        if len(batch_imgs) >= batch_size:
+            preds = inference_backend.predict_batch(batch_imgs)
+            for k, pred in zip(batch_keys, preds):
+                baseline_ground_truth[k] = [
+                    {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+                ]
+            batch_imgs = []
+            batch_keys = []
+    
+    if batch_imgs:
+        preds = inference_backend.predict_batch(batch_imgs)
+        for k, pred in zip(batch_keys, preds):
+            baseline_ground_truth[k] = [
+                {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+            ]
+            
+    return baseline_ground_truth # type: ignore
+
 class BenchmarkPipeline:
     """
     Orchestrates dataset iteration, on the fly modification, inference, evaluation.
@@ -97,7 +134,8 @@ class BenchmarkPipeline:
         storage_backend: StorageBackend,
         gpu_batch_size: int = 8,
         passes: int = 3,
-        step_size_percent: float = 10.0
+        step_size_percent: float = 10.0,
+        baseline_data: Optional[Dict[str, List[Dict]]] = None
     ):
         self.dataset_loader = dataset_loader
         self.modifier = modifier
@@ -106,7 +144,7 @@ class BenchmarkPipeline:
         self.gpu_batch_size = gpu_batch_size
         self.passes = passes
         self.step_size_percent = step_size_percent
-        self.baseline_ground_truth: Dict[str, List[Dict]] = {}
+        self.baseline_ground_truth: Dict[str, List[Dict]] = baseline_data if baseline_data is not None else {}
 
         #inmemory storage for final mAP calculation
         self.preds_by_pass: Dict[int, List[InferenceResult]] = {p: [] for p in range(self.passes + 1)}
@@ -117,35 +155,11 @@ class BenchmarkPipeline:
         self.total_dets: Dict[int, int] = {p: 0 for p in range(self.passes + 1)}
 
     def _baseline_key(self, rec: ImageRecord, path: str) -> str:
-        return rec.file_name if rec.file_name else path
+        return _baseline_key(rec, path)
 
     def build_baseline_ground_truth(self) -> None:
-        self.baseline_ground_truth = {}
-        
-        batch_imgs = []
-        batch_keys = []
-        batch_size = 32
-
-        for path, img, rec in self.dataset_loader.iter_samples():
-            key = self._baseline_key(rec, path)
-            batch_imgs.append(img)
-            batch_keys.append(key)
-            
-            if len(batch_imgs) >= batch_size:
-                preds = self.inference_backend.predict_batch(batch_imgs)
-                for k, pred in zip(batch_keys, preds):
-                    self.baseline_ground_truth[k] = [
-                        {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
-                    ]
-                batch_imgs = []
-                batch_keys = []
-        
-        if batch_imgs:
-            preds = self.inference_backend.predict_batch(batch_imgs)
-            for k, pred in zip(batch_keys, preds):
-                self.baseline_ground_truth[k] = [
-                    {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
-                ]
+        if not self.baseline_ground_truth:
+             self.baseline_ground_truth = compute_baseline(self.dataset_loader, self.inference_backend, self.gpu_batch_size)
 
     def _get_gt_list(self, rec: ImageRecord, path: str) -> List[Dict]:
         key = self._baseline_key(rec, path)
@@ -164,7 +178,6 @@ class BenchmarkPipeline:
             print("[pipeline] no readable images found")
             return results
 
-        print("[pipeline] Generating baseline ground truth from Pass 0 (Originals)...")
         self.build_baseline_ground_truth()
 
         pass_range = range(0, self.passes + 1)
