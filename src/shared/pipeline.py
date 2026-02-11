@@ -173,7 +173,7 @@ class BenchmarkPipeline:
         t_start = time.time()
 
         # pipelined execution
-        gen_executor = ProcessPoolExecutor(max_workers=4)
+        gen_executor = ProcessPoolExecutor(max_workers=12)
         
         data_iterator = enumerate(self.dataset_loader.iter_samples())
         
