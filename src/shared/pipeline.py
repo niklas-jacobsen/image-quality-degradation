@@ -173,7 +173,13 @@ class BenchmarkPipeline:
         t_start = time.time()
 
         # pipelined execution
-        gen_executor = ProcessPoolExecutor(max_workers=12)
+        total_cores = os.cpu_count() or 4
+        gen_workers = max(1, int(total_cores * 0.75))
+        metric_workers = max(1, total_cores - gen_workers - 1)
+        
+        print(f"[pipeline] Resource Allocation: Gen={gen_workers}, Metrics={metric_workers} (Total Cores: {total_cores})")
+        
+        gen_executor = ProcessPoolExecutor(max_workers=gen_workers)
         
         data_iterator = enumerate(self.dataset_loader.iter_samples())
         
@@ -205,7 +211,7 @@ class BenchmarkPipeline:
                     
                     # parallel metrics calculation
                     results_map: Dict[int, Dict[str, float]] = {} 
-                    with ThreadPoolExecutor() as metric_executor:
+                    with ThreadPoolExecutor(max_workers=metric_workers) as metric_executor:
                         future_to_pass = {
                             metric_executor.submit(measure_all, img): p 
                             for p, img in batch_data
