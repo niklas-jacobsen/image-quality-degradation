@@ -88,38 +88,57 @@ class DatasetLoader:
 def _baseline_key(rec: ImageRecord, path: str) -> str:
     return rec.file_name if rec.file_name else path
 
+def _load_image_safe(rec: ImageRecord, images_dir: str) -> Optional[Tuple[str, np.ndarray, ImageRecord]]:
+    path = os.path.join(images_dir, rec.file_name)
+    if not os.path.exists(path):
+        return None
+    img = cv.imread(path, cv.IMREAD_COLOR)
+    if img is None:
+        return None
+    return path, img, rec
+
 def compute_baseline(dataset_loader: DatasetLoader, inference_backend: InferenceBackend, batch_size: int = 32) -> Dict[str, List[Dict]]:
     """
-    Computes baseline predictions for the entire dataset.
+    Computes baseline predictions for the entire dataset using parallel loading.
     """
     baseline_ground_truth = {}
     
-    batch_imgs = []
-    batch_keys = []
+    records = list(dataset_loader.images.values())
+    total_images = len(records)
+    print(f"[compute_baseline] Generating baseline ground truth for {total_images} images (Batch Size: {batch_size})...")
 
-    print(f"[compute_baseline] Generating baseline ground truth for {len(dataset_loader.images)} images...")
-
-    for path, img, rec in dataset_loader.iter_samples():
-        key = _baseline_key(rec, path)
-        batch_imgs.append(img)
-        batch_keys.append(key)
-        
-        if len(batch_imgs) >= batch_size:
-            preds = inference_backend.predict_batch(batch_imgs)
-            for k, pred in zip(batch_keys, preds):
-                baseline_ground_truth[k] = [
-                    {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
-                ]
-            batch_imgs = []
-            batch_keys = []
+    num_workers = os.cpu_count() or 4
     
-    if batch_imgs:
-        preds = inference_backend.predict_batch(batch_imgs)
-        for k, pred in zip(batch_keys, preds):
-            baseline_ground_truth[k] = [
-                {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+    with ThreadPoolExecutor(max_workers=num_workers) as loader_executor:
+        for i in range(0, total_images, batch_size):
+            chunk_records = records[i : i + batch_size]
+            
+            futures = [
+                loader_executor.submit(_load_image_safe, rec, dataset_loader.images_dir) 
+                for rec in chunk_records
             ]
             
+            batch_imgs = []
+            batch_keys = []
+            
+            for f in futures:
+                res = f.result()
+                if res:
+                    path, img, rec = res
+                    batch_imgs.append(img)
+                    batch_keys.append(_baseline_key(rec, path))
+            
+            #batch inference
+            if batch_imgs:
+                preds = inference_backend.predict_batch(batch_imgs)
+                for k, pred in zip(batch_keys, preds):
+                    baseline_ground_truth[k] = [
+                        {"bbox": b, "category_id": l} for b, l in zip(pred.boxes, pred.labels)
+                    ]
+            
+            print(f"  [Baseline] Processed {min(i + batch_size, total_images)}/{total_images}...", end="\r")
+            
+    print("")
     return baseline_ground_truth # type: ignore
 
 class BenchmarkPipeline:
