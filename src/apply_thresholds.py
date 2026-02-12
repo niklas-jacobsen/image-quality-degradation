@@ -145,8 +145,33 @@ def check_image(img_metrics: Dict, constraints: List[Dict]) -> Tuple[bool, List[
 
     return not failed, reasons
 
+from typing import Dict, Any, List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def validate_image_task(fpath: str, constraints: List[Dict], move_to_dir: Optional[str] = None) -> Tuple[str, bool, List[str], Dict]:
+    """
+    Process a single image: Read -> Measure -> Check -> (Optional Move)
+    Returns: (filename, passed, reasons, metrics)
+    """
+    fname = os.path.basename(fpath)
+    try:
+        img = cv.imread(fpath)
+        if img is None:
+            return fname, False, ["Image load failed"], {}
+
+        metrics = measure_all(img)
+        passed, reasons = check_image(metrics, constraints)
+
+        if not passed and move_to_dir:
+            fail_path = os.path.join(move_to_dir, f"FAIL_{fname}")
+            cv.imwrite(fail_path, img)
+
+        return fname, passed, reasons, metrics
+    except Exception as e:
+        return fname, False, [f"Exception: {str(e)}"], {}
+
 def main():
-    parser = argparse.ArgumentParser(description="Filter images using MULTIPLE quality thresholds")
+    parser = argparse.ArgumentParser(description="Filter images using one or more quality thresholds")
     parser.add_argument("--images-dir", "-dir", required=True, help="Path to input images")
     parser.add_argument("--thresholds-json", "-json", required=True, help="Path to generated thresholds.json")
     parser.add_argument("--output-json", "-out", default="validation_report.json", help="Path to save report")
@@ -154,6 +179,7 @@ def main():
     
     args = parser.parse_args()
 
+    #load configuration
     try:
         configs = load_all_configs(args.thresholds_json)
         if not configs:
@@ -172,47 +198,54 @@ def main():
         os.makedirs(args.move_images_to, exist_ok=True)
 
     valid_exts = ('.jpg', '.png', '.jpeg')
+    if not os.path.isdir(args.images_dir):
+        print(f"[Error] Images directory not found: {args.images_dir}")
+        sys.exit(1)
+
     files = [f for f in os.listdir(args.images_dir) if f.lower().endswith(valid_exts)]
+    total_files = len(files)
     
-    stats = {"total": 0, "passed": 0, "failed": 0}
+    stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0}
     report_details = {}
 
-    print(f"\n[Run] checking {len(files)} images...")
+    print(f"\n[Run] checking {total_files} images using {os.cpu_count()} cores...")
 
-    for i, fname in enumerate(files):
-        fpath = os.path.join(args.images_dir, fname)
-        img = cv.imread(fpath)
+    #parallel execution
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = []
+        for fname in files:
+            fpath = os.path.join(args.images_dir, fname)
+            futures.append(executor.submit(validate_image_task, fpath, constraints, args.move_images_to))
         
-        if img is None:
-            continue
+        for i, future in enumerate(as_completed(futures)):
+            fname, passed, reasons, metrics = future.result()
+            
+            stats["total"] += 1
+            if passed:
+                stats["passed"] += 1
+                status = "PASS"
+            else:
+                if "Image load failed" in reasons or any("Exception" in r for r in reasons):
+                     stats["errors"] += 1
+                     status = "ERROR"
+                else:
+                    stats["failed"] += 1
+                    status = "FAIL"
 
-        metrics = measure_all(img)
-        passed, reasons = check_image(metrics, constraints)
-        
-        stats["total"] += 1
-        if passed:
-            stats["passed"] += 1
-            status = "PASS"
-        else:
-            stats["failed"] += 1
-            status = "FAIL"
-            if args.move_images_to:
-                fail_path = os.path.join(args.move_images_to, f"FAIL_{fname}")
-                cv.imwrite(fail_path, img)
-
-        report_details[fname] = {
-            "status": status,
-            "reasons": reasons,
-            "metrics": metrics
-        }
-        
-        if i % 10 == 0:
-            print(f"Progress: {i}/{len(files)} (Failed: {stats['failed']})", end="\r")
+            report_details[fname] = {
+                "status": status,
+                "reasons": reasons,
+                "metrics": metrics
+            }
+            
+            if (i + 1) % 50 == 0:
+                print(f"Progress: {i + 1}/{total_files} (Passed: {stats['passed']} | Failed: {stats['failed']})", end="\r")
 
     print(f"\n\n[Complete]")
     print(f"Total:  {stats['total']}")
     print(f"Passed: {stats['passed']}")
     print(f"Failed: {stats['failed']}")
+    print(f"Errors: {stats['errors']}")
     
     output_path = args.output_json
     
