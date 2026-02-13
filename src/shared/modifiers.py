@@ -122,7 +122,9 @@ class NoiseModifier:
     def apply(self, img: np.ndarray, pass_index: int) -> np.ndarray:
         if pass_index <= 0: return img.copy()
         # increase variance with pass
-        sigma = (self.step_percent * pass_index) * 2.0
+        base_sigma = (self.step_percent * pass_index) * 2.0
+        sigma = abs(base_sigma)
+
         noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
         noisy = img.astype(np.float32) + noise
         return np.clip(noisy, 0, 255).astype(np.uint8)
@@ -206,10 +208,14 @@ class FogModifier:
         img_rgb = cv.cvtColor(img, cv.COLOR_BGR2RGB)
         
         intensity = min(1.0, (self.step_percent / 100.0) * pass_index)
+        fog_coef_lower = min(1.0, 0.1 * intensity)
+        fog_coef_upper = min(1.0, 1.0 * intensity)
+        alpha_coef = min(1.0, 0.08 * intensity)
+
         transform = A.RandomFog(
-            fog_coef_lower=0.1 * intensity, 
-            fog_coef_upper=1.0 * intensity, 
-            alpha_coef=0.08 * intensity, 
+            fog_coef_lower=fog_coef_lower, 
+            fog_coef_upper=fog_coef_upper, 
+            alpha_coef=alpha_coef, 
             p=1.0
         )
         aug = transform(image=img_rgb)["image"]
@@ -263,9 +269,11 @@ class SnowModifier:
         intensity = (self.step_percent / 100.0) * pass_index
         snow_val = 0.1 + (0.4 * intensity)
         
+        snow_point_lower = min(1.0, snow_val)
+        snow_point_upper = min(1.0, snow_val + 0.1)
+        
         transform = A.RandomSnow(
-            snow_point_lower=snow_val, 
-            snow_point_upper=snow_val + 0.1, 
+            snow_point_range=(snow_point_lower, snow_point_upper), 
             brightness_coeff=2.5, 
             p=1.0
         )
